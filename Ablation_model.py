@@ -3,15 +3,11 @@ from torch import nn, Tensor
 from torch.nn import functional as F
 from torchstat import stat
 import time
-import sys
-sys.path.append('/root/autodl-tmp/MyFrame/datacode/model')#导入semseg所需的环境
-from ablation.mobilevit_v3_v2 import *
+from mobilevit_v3_v2 import *
 from ExternalAttentionWithChannelSimilarityMulAvg import ExternalAttention
 from thop import profile
 from torchstat import stat
 from torchsummary import summary
-from mobilevit_v3_v2_ablation import MobileViTBlockv3_v2_Ablation
-from droppath import DropPath
 #可学习的权重参数
 class AdaptiveWeight(nn.Module):
     def __init__(self, init_value=1e-3):
@@ -20,34 +16,6 @@ class AdaptiveWeight(nn.Module):
     def forward(self, input):
         return input * self.scale
 #带有高通滤波的block
-
-class MobileBlock(nn.Module):
-    expansion = 1
-    middleExpansion = 2
-
-    def __init__(self, c1, c2, s=1, downsample=None, no_relu=False) -> None:
-        super().__init__()
-        self.conv1 = nn.Conv2d(c1, c2 * self.middleExpansion, 1, 1, 0, bias=False)
-        self.bn1 = nn.BatchNorm2d(c2 * self.middleExpansion)
-        self.conv2 = nn.Conv2d(c2 * self.middleExpansion, c2 * self.middleExpansion, 3, s, 1, groups=c2 * self.middleExpansion,
-                               bias=False)
-        self.bn2 = nn.BatchNorm2d(c2 * self.middleExpansion)
-        self.conv3 = nn.Conv2d(c2 * self.middleExpansion, c2, 1, 1, 0)
-        self.bn3 = nn.BatchNorm2d(c2)
-        self.downsample = downsample
-        self.no_relu = no_relu
-
-    def forward(self, x: Tensor) -> Tensor:
-        identity = x
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        out = F.relu(out)
-        out = self.bn3(self.conv3(out))
-        if self.downsample is not None: identity = self.downsample(x)
-        out += identity
-        return out if self.no_relu else F.relu(out)
-
-
 class Block(nn.Module):
     expansion=1
     def __init__(self,c1,c2,stride=1):
@@ -105,17 +73,16 @@ class External_block(nn.Module):
         self.norm=nn.LayerNorm(d_model)
         self.w= nn.Parameter(torch.FloatTensor(2))#权重设置
         self.mlp = Mlp(in_features=d_model, hidden_features=d_model, act_layer=nn.ReLU, drop=0.)
-        # self.dropout=torch.nn.Dropout(p=0.1)
+        
+
     def forward(self, x):
         w1 = torch.exp(self.w[0]) / torch.sum(torch.exp(self.w))
         w2 = torch.exp(self.w[1]) / torch.sum(torch.exp(self.w))
         B,C,H,W=x.shape
         x = x.flatten(2).transpose(1, 2) #B,C,H,W->B,N,C
-        x = w1*x + w2*self.ea(self.norm(x))
-        x = x + self.ea(self.norm(x))
+        x = w1*x + w2*self.ea(self.norm(x))        
         x = x.reshape(B, H, W, -1).permute(0, 3, 1, 2) #B,N,C->B,C,H,W
         x = x + self.mlp(x)
-        # x = self.dropout(x)
         return x
     
     
@@ -269,7 +236,7 @@ class SegHead(nn.Module):
             H, W = x.shape[-2] * self.scale_factor, x.shape[-1] * self.scale_factor
             out = F.interpolate(out, size=(H, W), mode='bilinear', align_corners=False)
         return out
-class Ablation_model(nn.Module):
+class final_model(nn.Module):
     def __init__(self, backbone: str = None, num_classes: int = 19) -> None:
         super().__init__()
         planes, spp_planes, head_planes = [32, 64, 128, 256, 512], 128, 64
@@ -291,11 +258,7 @@ class Ablation_model(nn.Module):
         self.layer3_MobileViTBlockv3_v2= MobileViTBlockv3_v2(planes[2], attn_dim[0], ffn_multiplier,  attn_blocks=1, patch_size=patch_size)
         self.layer4 = nn.Sequential(
             InvertedResidual(planes[2], planes[3], stride=2, expand_ratio=mv2_exp_mult),#128->512->256
-            # InvertedResidual(planes[3], planes[3], stride=1, expand_ratio=mv2_exp_mult),#128->512->256
-
             External_block(d_model=256,S=64)
-            # MobileViTBlockv3_v2_Ablation(planes[3], attn_dim[2], ffn_multiplier, attn_blocks=1,
-            #         patch_size=patch_size)
         )
         self.layer5 = nn.Sequential(
             InvertedResidual(planes[3], planes[3], stride=1, expand_ratio=mv2_exp_mult),
@@ -304,8 +267,6 @@ class Ablation_model(nn.Module):
         self.layer5_MobileViTBlockv3_v2 =MobileViTBlockv3_v2(planes[3], attn_dim[2], ffn_multiplier, attn_blocks=1,
                                 patch_size=patch_size)
         self.layer3_ = self._make_layer(Block, planes[1], planes[1], 2)
-#         MobileBlock
-#         Block
         self.layer4_ = self._make_layer(Block, planes[1], planes[1], 2)
         self.layer5_ = self._make_layer(Block, planes[1], planes[2], 1)
 
@@ -397,42 +358,32 @@ class Ablation_model(nn.Module):
 if __name__ == '__main__':
     torch.backends.cudnn.enabled = True
     torch.backends.cudnn.benchmark = True
-    model = Ablation_model(num_classes=4).cuda()
+    model = final_model(num_classes=4).cuda()
+    input=torch.randn(1,3,1600,256).cuda()
+    print(model)
     model.eval()
     print(model)
-    input200=torch.randn(1,3,1600,256).cuda()
-    # input512=torch.randn(1,3,512,512).cuda()
-    # input1600=torch.randn(1,3,1600,256).cuda()
-    # inputs=[input200,input512,input1600]
-    inputs=[input200]
-
-    # input=torch.randn(1,3,512,512).cuda()
-    # print(model)
-    # model.eval()
-    # print(model)
     # # print(model)
     # model(input)
-    flops, params = profile(model, inputs=(input200,))
+    flops, params = profile(model, inputs=(input,))
     print("FLOPs=", str(flops/1e9) + '{}'.format("G"))
     print("params=", str(params/1e6) + '{}'.format("M"))
-    # model.train(False)
-    # model.eval()
-    # input=torch.randn(1,3,512,256).cuda()
-    for i in range(1):
-        input=inputs[i]
-        warm_iter=300
-        iteration=1000
-        print('=========Speed Testing=========')
-        fps_time=[]
-        for _ in range(iteration): #iteration=20
-            if _<warm_iter:
-                model(input)
-            else:
-                start=time.time()
-                model(input)
-                end=time.time()
-                fps_time.append(end-start)
-        time_sum = 0
-        for i in fps_time:
-            time_sum += i
-        print("FPS: %f"%(1.0/(time_sum/len(fps_time))))
+    model.train(False)
+    model.eval()
+    input=torch.randn(1,3,1600,256).cuda()
+    warm_iter=300
+    iteration=1000
+    print('=========Speed Testing=========')
+    fps_time=[]
+    for _ in range(iteration): #iteration=20
+        if _<warm_iter:
+            model(input)
+        else:
+            start=time.time()
+            model(input)
+            end=time.time()
+            fps_time.append(end-start)
+    time_sum = 0
+    for i in fps_time:
+        time_sum += i
+    print("FPS: %f"%(1.0/(time_sum/len(fps_time))))
